@@ -1,445 +1,289 @@
 import argparse
-from pathlib import Path
-import time
-import random
-from typing import Union, Tuple, Optional, List, Dict, Callable # Added Union
-
 import torch
-import torch.nn as nn # Added import for nn
-import torch.onnx
-import numpy as np
+import torch.nn as nn # For nn.DataParallel
 import pandas as pd
-import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+import json # For saving metrics
+import random # For selecting CAM images
 import cv2
-import pydicom # For visualize_dicom_images, if included
+import matplotlib.pyplot as plt
+import os # For os.cpu_count()
+import sys
+from collections import OrderedDict # For loading state_dict
 
 from torch.utils.data import DataLoader
 import torchmetrics
-from sklearn.metrics import confusion_matrix, roc_curve, auc as sklearn_auc # For more detailed metrics
-from tqdm.auto import tqdm # Added tqdm for progress bars
 
-# Assuming model.py, data_loader.py, utils.py are in the same package
-from .model import PneumoniaModelCAM # Or your specific model class
-from .data_loader import PneumoniaDataset, get_val_transforms, DEFAULT_MEAN, DEFAULT_STD
-from .utils import get_device, format_time, DEVICE
+# Add project root to sys.path
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
-# ============================ Model Loading ============================ #
+from pneumonia_cam.utils import get_device, format_time 
+from pneumonia_cam.data_loader import PneumoniaDataset, default_val_transforms 
+from pneumonia_cam.model import PneumoniaModelCAM
 
-def load_model_from_checkpoint(
-    checkpoint_path: Union[str, Path],
-    model_class: torch.nn.Module = PneumoniaModelCAM, # Allow specifying model class
-    device: torch.device = DEVICE,
-    **model_kwargs
-) -> torch.nn.Module:
-    """
-    Loads a model from a saved checkpoint.
-    The checkpoint is expected to contain 'model_state_dict' and 'config'.
+def define_arg_parser():
+    parser = argparse.ArgumentParser(description="Evaluate Pneumonia Detection Model and Generate CAMs.")
+    parser.add_argument('--checkpoint_path', type=str, required=True, help='Path to the model checkpoint (.pth file).')
+    parser.add_argument('--data_dir', type=str, required=True, help='Path to processed data directory (e.g., Processed/, containing dataset_stats.json and train/val splits).')
+    parser.add_argument('--label_csv', type=str, required=True, help='Path to the CSV file with labels (e.g., stage_2_train_labels.csv).')
+    parser.add_argument('--output_dir', type=str, required=True, help='Directory to save evaluation metrics and CAM visualizations.')
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'], help='Dataset split to evaluate on.')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for evaluation.')
+    parser.add_argument('--num_workers', type=int, default=None, help='Number of workers for DataLoader. Defaults to os.cpu_count().')
+    
+    # Model parameters (defaults provided, but should ideally match checkpoint's saved args)
+    parser.add_argument('--img_size', type=int, default=224, help='Image size used for training.')
+    parser.add_argument('--in_channels', type=int, default=1, help='Number of input channels.')
+    parser.add_argument('--model_name', type=str, default='efficientnet_b0', help='TIMM model architecture name.')
+    parser.add_argument('--num_classes', type=int, default=1, help='Number of classes.') # Should be 1 for binary
+    parser.add_argument('--classifier_hidden_dim', type=int, default=512, help='Classifier hidden dimension.')
+    parser.add_argument('--classifier_dropout_rate', type=float, default=0.3, help='Classifier dropout rate.')
 
-    Args:
-        checkpoint_path (Union[str, Path]): Path to the .pth checkpoint file.
-        model_class (torch.nn.Module): The class of the model to instantiate.
-        device (torch.device): Device to load the model onto.
-        **model_kwargs: Additional keyword arguments to pass to the model constructor
-                        if 'config' is not found in checkpoint or to override.
+    parser.add_argument('--num_cam_images', type=int, default=5, help='Number of random images for CAM generation. 0 to disable.')
+    return parser
 
-    Returns:
-        torch.nn.Module: The loaded model.
-    """
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+def visualize_and_save_cam(
+    original_image_tensor: torch.Tensor, # Should be the tensor BEFORE normalization for best viz
+    cam_map_np: np.ndarray,
+    logits: torch.Tensor, # Raw logits for the image
+    output_path: Path,
+    threshold: float = 0.0 # Logits threshold for positive prediction
+):
+    img_display = original_image_tensor.cpu().squeeze() 
+    if img_display.ndim == 3 and img_display.shape[0] == 1: 
+        img_display = img_display.squeeze(0)
+    elif img_display.ndim == 3 and img_display.shape[0] != 1: 
+         img_display = img_display.permute(1,2,0)
+    
+    img_np = img_display.numpy().astype(np.float32)
 
-    print(f"Loading checkpoint from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Denormalize if mean/std were part of original_image_tensor's transforms
+    # For simplicity, assuming original_image_tensor is [0,1] or can be displayed as is.
+    # If it was normalized, we'd need mean/std to reverse it for accurate visualization.
+    # The current PneumoniaDataset.__getitem__ returns normalized tensor.
+    # For true original, one would need to load from .npy and just ToTensor().
+    if img_np.min() < -1.0 or img_np.max() > 1.0 + 1e-5 : # Heuristic for normalized image
+         # Attempt to shift towards [0,1] if it looks like it was normalized with mean~0.5, std~0.25
+         if -2.0 < img_np.min() < -0.1 and img_np.max() < 2.0 : # very rough guess for imagenet-style norm
+            img_np = (img_np * 0.229) + 0.485 # Example reverse for one common normalization
+            img_np = np.clip(img_np, 0, 1)
 
-    # Get model configuration from checkpoint if available
-    cfg_from_checkpoint = checkpoint.get('config')
 
-    model_args = {} # Initialize model_args
-    if cfg_from_checkpoint:
-        print("Found model configuration in checkpoint.")
-        # Ensure essential args are present, allow overrides from model_kwargs
-        model_args = {
-            'pretrained_model_name': cfg_from_checkpoint.model_name,
-            'num_classes': 1, # Assuming binary for this project from context
-            'in_channels': cfg_from_checkpoint.in_channels,
-            'img_size': cfg_from_checkpoint.img_size,
-            'classifier_hidden_dim': cfg_from_checkpoint.classifier_hidden_dim,
-            'classifier_dropout_rate': cfg_from_checkpoint.classifier_dropout_rate,
-        }
-        model_args.update(model_kwargs) # Override with any explicit kwargs
-        model = model_class(**model_args)
-    else:
-        print("WARNING: Model configuration not found in checkpoint. Using provided model_kwargs or defaults.")
-        if not model_kwargs:
-            # Try to infer from a potentially simpler model state dict or raise error
-            print("ERROR: No config in checkpoint and no model_kwargs provided. Cannot instantiate model.")
-            # A common practice is to save enough model args in config to reinstantiate
-            # For now, if this happens, it's an issue with the checkpoint or call.
-            raise ValueError("Cannot determine model architecture. Checkpoint needs 'config' or provide model_kwargs.")
-        model_args.update(model_kwargs) # Ensure model_kwargs are stored in model_args for printout
-        model = model_class(**model_args)
+    if img_np.min() < 0.0 or img_np.max() > 1.0: # If still not in range, clip after trying to denorm
+        img_np = (img_np - np.min(img_np)) / (np.max(img_np) - np.min(img_np) + 1e-8)
+        img_np = np.clip(img_np, 0, 1)
 
-    # Handle DataParallel state_dict
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+    ax[0].imshow(img_np, cmap='bone')
+    ax[0].set_title("Original Image (Processed)")
+    ax[0].axis('off')
+
+    ax[1].imshow(img_np, cmap='bone')
+    ax[1].imshow(cam_map_np, alpha=0.5, cmap='jet')
+    
+    prob = torch.sigmoid(logits).item()
+    is_positive = logits.item() > threshold
+    ax[1].set_title(f"Prediction Positive: {is_positive} (Prob: {prob:.3f}, Logit: {logits.item():.3f})")
+    ax[1].axis('off')
+    
+    plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path)
+    # print(f"CAM saved to {output_path}")
+    plt.close(fig)
+
+def main(args):
+    output_dir = Path(args.output_dir)
+    cam_output_dir = output_dir / 'cam_visualizations'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cam_output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = get_device()
+    num_workers = args.num_workers if args.num_workers is not None else os.cpu_count()
+
+    print(f"Loading checkpoint from: {args.checkpoint_path}")
+    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    
+    # Try to load model architecture args from checkpoint, otherwise use command line args
+    # This makes evaluation more robust if model details change.
+    ckpt_args = checkpoint.get('args', {}) # Assuming 'args' (dict) was saved in checkpoint
+    
+    model_name = ckpt_args.get('model_name', args.model_name)
+    in_channels = ckpt_args.get('in_channels', args.in_channels)
+    img_size = ckpt_args.get('img_size', args.img_size)
+    num_classes = ckpt_args.get('num_classes', args.num_classes)
+    classifier_hidden_dim = ckpt_args.get('classifier_hidden_dim', args.classifier_hidden_dim)
+    classifier_dropout_rate = ckpt_args.get('classifier_dropout_rate', args.classifier_dropout_rate)
+    # pos_weight for criterion is not needed for model init here, but good to log if it was used.
+    # criterion_pos_weight = ckpt_args.get('pos_weight', None) 
+
+    print(f"Initializing model '{model_name}' for evaluation...")
+    model = PneumoniaModelCAM(
+        pretrained_model_name=model_name,
+        num_classes=num_classes,
+        in_channels=in_channels,
+        img_size=img_size,
+        classifier_hidden_dim=classifier_hidden_dim,
+        classifier_dropout_rate=classifier_dropout_rate
+        # criterion_pos_weight is part of model's criterion, not needed for re-init if not training
+    )
+
     state_dict = checkpoint['model_state_dict']
-    if any(key.startswith('module.') for key in state_dict.keys()):
-        print("Adjusting DataParallel state_dict keys.")
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
+    if all(key.startswith('module.') for key in state_dict.keys()):
+        print("Adjusting state_dict from DataParallel model.")
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            name = k[7:] # remove `module.`
+            new_state_dict[name] = v
+        state_dict = new_state_dict
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
-    print(f"Model '{model_args.get('pretrained_model_name', 'N/A')}' loaded successfully and set to eval mode.")
-    return model
+    print("Model loaded and set to evaluation mode.")
 
-# ============================ CAM Generation ============================ #
+    # Data
+    print(f"Loading labels from: {args.label_csv} for split: {args.split}")
+    if not Path(args.label_csv).exists():
+        raise FileNotFoundError(f"Label CSV file not found: {args.label_csv}")
+    labels_df = pd.read_csv(args.label_csv)
 
-def generate_cam(
-    model: PneumoniaModelCAM,
-    img_tensor: torch.Tensor, # Expected single image tensor [C, H, W] or [H,W]
-    target_size: Optional[Tuple[int, int]] = None # (width, height) for resizing CAM
-) -> Tuple[np.ndarray, float]:
-    """
-    Generates a Class Activation Map (CAM) for a given image tensor using the model.
-    This version uses the weights of the final linear layer of the classifier.
-
-    Args:
-        model (PneumoniaModelCAM): The trained model instance.
-        img_tensor (torch.Tensor): Input image tensor (e.g., [C, H, W] or [H,W] for grayscale).
-        target_size (Optional[Tuple[int, int]]): The target (width, height) to resize the CAM to.
-                                                 If None, uses original image size if possible or feature map size.
-
-    Returns:
-        Tuple[np.ndarray, float]:
-            - cam_normalized (np.ndarray): The normalized CAM as a 2D NumPy array.
-            - probability (float): The predicted probability for the positive class.
-    """
-    model.eval()
-    model_device = next(model.parameters()).device # Get device model is on
-
-    # Prepare image tensor
-    if not isinstance(img_tensor, torch.Tensor):
-        img_tensor = torch.from_numpy(img_tensor).float()
-
-    processed_img_tensor = img_tensor.to(model_device)
-    # Check if model is in half precision (common attribute name might be model.dtype)
-    # This check is a bit heuristic; a more robust way might involve checking a parameter's dtype.
-    if hasattr(model, 'dtype') and model.dtype == torch.float16:
-        processed_img_tensor = processed_img_tensor.half()
-    elif next(model.parameters()).dtype == torch.float16: # Check parameter dtype
-        processed_img_tensor = processed_img_tensor.half()
-
-
-    if processed_img_tensor.ndim == 2: # Grayscale [H, W] -> [1, H, W]
-        processed_img_tensor = processed_img_tensor.unsqueeze(0)
-    if processed_img_tensor.ndim != 3:
-        raise ValueError(f"Input img_tensor must be 2D [H,W] or 3D [C,H,W], got {processed_img_tensor.ndim}D")
-
-    input_batch = processed_img_tensor.unsqueeze(0) # [C, H, W] -> [1, C, H, W]
-
-    # Get feature maps and logits
-    with torch.no_grad():
-        logits, feature_maps = model(input_batch) # feature_maps: [1, C_feat, H_feat, W_feat]
-
-    # Get weights from the final linear layer of the classifier
-    # Accessing the EnhancedClassifier's feature_map_processor, then its last layer
-    final_fc_layer = model.classifier.feature_map_processor[-1]
-    if not isinstance(final_fc_layer, nn.Linear): # Use nn after import
-        raise TypeError("The last layer of EnhancedClassifier's feature_map_processor is not nn.Linear.")
-
-    classifier_weights = final_fc_layer.weight.squeeze()
-    if classifier_weights.ndim == 0:
-        classifier_weights = classifier_weights.unsqueeze(0)
-
-
-    squeezed_feature_maps = feature_maps.squeeze(0)
-
-    if classifier_weights.ndim > 1 and classifier_weights.shape[0] > 1:
-        pred_class_idx = torch.argmax(logits, dim=1).item() if logits.ndim > 1 and logits.shape[1] > 1 else 0
-        weights_for_cam = classifier_weights[pred_class_idx, :]
-    else:
-        weights_for_cam = classifier_weights
-
-    cam = torch.einsum('c,chw->hw', weights_for_cam, squeezed_feature_maps)
-    cam_np = cam.cpu().numpy()
-
-    cam_np = cam_np - np.min(cam_np)
-    if np.max(cam_np) > 1e-6:
-        cam_np = cam_np / np.max(cam_np)
-    else:
-        cam_np = np.zeros_like(cam_np)
-
-    if target_size:
-        cam_resized = cv2.resize(cam_np, target_size, interpolation=cv2.INTER_LINEAR)
-    else:
-        if img_tensor.ndim >= 2:
-            original_h = img_tensor.shape[-2]
-            original_w = img_tensor.shape[-1]
-            cam_resized = cv2.resize(cam_np, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
+    if not labels_df.empty:
+        if labels_df['patientId'].duplicated().any():
+            cols_for_nonnull = ['x', 'y', 'width', 'height', 'Target']
+            for col in cols_for_nonnull:
+                if col not in labels_df.columns: labels_df[col] = np.nan
+            labels_df["nonnull_count"] = labels_df[cols_for_nonnull].notnull().sum(axis=1)
+            max_nonnull_idx = labels_df.groupby("patientId")["nonnull_count"].idxmax()
+            deduplicated_labels_df = labels_df.loc[max_nonnull_idx].copy()
+            deduplicated_labels_df.drop(columns="nonnull_count", inplace=True, errors='ignore')
         else:
-            cam_resized = cam_np
+            deduplicated_labels_df = labels_df.copy()
+        deduplicated_labels_df.reset_index(drop=True, inplace=True)
+    else:
+        raise ValueError("Label CSV file is empty.")
 
-    probability = torch.sigmoid(logits.squeeze()).item()
-    return cam_resized, probability
+    print(f"Creating DataLoader for data in: {args.data_dir}, split: {args.split}")
+    # PneumoniaDataset expects default_val_transforms to be applied.
+    # default_val_transforms includes ToTensor and Normalize (internally by PneumoniaDataset now)
+    eval_dataset = PneumoniaDataset(
+        root_dir=Path(args.data_dir),
+        split=args.split,
+        dataframe=deduplicated_labels_df,
+        transform=default_val_transforms # Pass the default val transforms
+    )
+    
+    if len(eval_dataset) == 0:
+        print(f"Warning: Evaluation dataset for split '{args.split}' is empty. Check data_dir and label_csv.")
+        # Create dummy metrics and exit or proceed with CAM if possible
+        metrics = {"accuracy": 0, "auroc": 0, "sensitivity": 0, "specificity": 0, 
+                   "tn": 0, "fp": 0, "fn": 0, "tp": 0, "samples": 0}
+        with open(output_dir / "metrics.json", 'w') as f:
+            json.dump(metrics, f, indent=4)
+        print(f"Metrics saved to {output_dir / 'metrics.json'}")
+        if args.num_cam_images > 0: print("Skipping CAM generation as dataset is empty.")
+        return
 
-# ============================ Visualization ============================ #
 
-def visualize_cam_overlay(
-    original_image_np: np.ndarray, # Expected (H, W) or (H, W, C)
-    cam_np: np.ndarray, # Expected (H, W)
-    prediction_prob: float,
-    actual_label: Optional[int] = None,
-    figsize: Tuple[int, int] = (10, 5)
-):
-    plt.style.use('seaborn-v0_8-whitegrid')
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
 
-    img_display = original_image_np.astype(np.float32)
-    if img_display.min() < 0 or img_display.max() > 1:
-        img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min() + 1e-6)
-
-    if img_display.ndim == 3 and img_display.shape[-1] == 1:
-        img_display = img_display.squeeze(-1)
-
-    axes[0].imshow(img_display, cmap='bone')
-    axes[0].set_title("Original Image")
-    axes[0].axis('off')
-
-    axes[1].imshow(img_display, cmap='bone')
-    axes[1].imshow(cam_np, cmap='jet', alpha=0.5)
-
-    title_str = f"Prediction: {prediction_prob:.2f} ('Pneumonia' if >0.5)"
-    if actual_label is not None:
-        title_str += f"\nActual: {'Pneumonia' if actual_label == 1 else 'Normal'}"
-    axes[1].set_title(title_str)
-    axes[1].axis('off')
-
-    plt.tight_layout()
-    plt.show(block=False) # Use block=False to avoid blocking in scripts
-    plt.pause(0.1) # Pause to allow plot to render
-
-# ============================ Evaluation Metrics ============================ #
-
-def evaluate_model(
-    model: torch.nn.Module,
-    dataloader: DataLoader,
-    device: torch.device = DEVICE
-) -> Dict[str, float]:
-    model.eval()
-    model.to(device)
-
-    all_preds_proba = []
-    all_labels = []
-
+    # Metrics
     accuracy_metric = torchmetrics.Accuracy(task="binary").to(device)
     auroc_metric = torchmetrics.AUROC(task="binary").to(device)
-    precision_metric = torchmetrics.Precision(task="binary").to(device)
-    recall_metric = torchmetrics.Recall(task="binary").to(device)
-    specificity_metric = torchmetrics.Specificity(task="binary").to(device)
-    f1_metric = torchmetrics.F1Score(task="binary").to(device)
+    cm_metric = torchmetrics.ConfusionMatrix(task="binary", num_classes=2).to(device) # num_classes=2 for TN,FP,FN,TP
 
-    progress_bar = tqdm(dataloader, desc="Evaluating", leave=False)
+    all_preds_proba = []
+    all_labels_list = [] # Renamed to avoid conflict
+
+    print(f"Starting evaluation on {args.split} split...")
     with torch.no_grad():
-        for imgs, labels in progress_bar:
-            imgs, labels = imgs.to(device), labels.float().unsqueeze(1).to(device)
+        for images, labels in tqdm(eval_loader, desc=f"Evaluating {args.split}", unit="batch"):
+            images, labels = images.to(device), labels.to(device).squeeze(-1).int() # Squeeze label for metrics
+            
+            logits, _ = model(images) # Logits are [B]
+            probs = torch.sigmoid(logits)
 
-            logits, _ = model(imgs)
-            if logits.ndim == 1 and labels.ndim == 2 and labels.shape[1] == 1:
-                logits = logits.unsqueeze(1)
+            accuracy_metric.update(probs, labels)
+            auroc_metric.update(probs, labels)
+            cm_metric.update(probs, labels)
+            
+            all_preds_proba.extend(probs.cpu().numpy())
+            all_labels_list.extend(labels.cpu().numpy())
 
-            preds_proba = torch.sigmoid(logits)
+    acc = accuracy_metric.compute().item()
+    auroc = auroc_metric.compute().item()
+    cm = cm_metric.compute().cpu().numpy()
 
-            all_preds_proba.append(preds_proba.cpu())
-            all_labels.append(labels.cpu().int())
+    if cm.size == 4: # Ensure cm is 2x2
+        tn, fp, fn, tp = cm.ravel()
+    else: # Handle cases with no samples in one class or empty dataset
+        tn, fp, fn, tp = 0,0,0,0
+        print(f"Warning: Confusion matrix is not 2x2 ({cm.shape}). Metrics might be skewed or zero.")
 
-            accuracy_metric.update(preds_proba, labels.int())
-            auroc_metric.update(preds_proba, labels.int())
-            precision_metric.update(preds_proba, labels.int())
-            recall_metric.update(preds_proba, labels.int())
-            specificity_metric.update(preds_proba, labels.int())
-            f1_metric.update(preds_proba, labels.int())
 
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    
     metrics = {
-        "accuracy": accuracy_metric.compute().item(),
-        "auroc": auroc_metric.compute().item(),
-        "precision": precision_metric.compute().item(),
-        "recall (sensitivity)": recall_metric.compute().item(),
-        "specificity": specificity_metric.compute().item(),
-        "f1_score": f1_metric.compute().item(),
+        "accuracy": acc, "auroc": auroc,
+        "sensitivity_recall": sensitivity, "specificity": specificity,
+        "true_negatives": int(tn), "false_positives": int(fp),
+        "false_negatives": int(fn), "true_positives": int(tp),
+        "total_samples": len(all_labels_list)
     }
+    print(f"Evaluation Metrics ({args.split} split):")
+    for k, v in metrics.items(): print(f"  {k}: {v}")
 
-    if all_preds_proba and all_labels:
-        y_true = torch.cat(all_labels).numpy().flatten()
-        y_pred_proba = torch.cat(all_preds_proba).numpy().flatten()
-        y_pred_binary = (y_pred_proba > 0.5).astype(int)
+    with open(output_dir / f"metrics_{args.split}.json", 'w') as f:
+        json.dump(metrics, f, indent=4)
+    print(f"Metrics saved to {output_dir / f'metrics_{args.split}.json'}")
 
-        cm = confusion_matrix(y_true, y_pred_binary)
-        metrics["confusion_matrix (tn, fp, fn, tp)"] = cm.ravel().tolist()
-        print("Confusion Matrix (tn, fp, fn, tp):", metrics["confusion_matrix (tn, fp, fn, tp)"])
+    # CAM Visualization
+    if args.num_cam_images > 0 and len(eval_dataset) > 0:
+        print(f"Generating CAMs for {args.num_cam_images} random images...")
+        # Ensure we don't request more images than available
+        num_to_visualize = min(args.num_cam_images, len(eval_dataset))
+        random_indices = random.sample(range(len(eval_dataset)), num_to_visualize)
 
-    return metrics
+        for i, idx in enumerate(tqdm(random_indices, desc="Generating CAMs", unit="image")):
+            img_tensor, label = eval_dataset[idx] # This tensor is already transformed by PneumoniaDataset (incl. normalization)
+            
+            # For visualize_and_save_cam, we want original_image_tensor to be less processed if possible.
+            # However, PneumoniaDataset applies normalization. We can pass the normalized one for now,
+            # or try to get an unnormalized version if needed (would require changing dataset or loading manually).
+            # The current CAM method uses the model's device and dtype.
+            
+            cam_np, cam_logits = model.generate_cam(
+                img_tensor.unsqueeze(0), # Add batch dim, model.generate_cam handles device
+                target_size=(args.img_size, args.img_size)
+            )
 
-# ============================ ONNX Export ============================ #
-def export_to_onnx(
-    model: torch.nn.Module,
-    dummy_input_shape: Tuple[int, int, int, int],
-    onnx_path: Union[str, Path],
-    opset_version: int = 12
-):
-    model.eval()
-    model.to(torch.device('cpu'))
-
-    dummy_input = torch.randn(*dummy_input_shape, device='cpu')
-    output_names = ["logits", "feature_maps"] if isinstance(model, PneumoniaModelCAM) else ["output"]
-
-    dynamic_axes_config = {'input_image': {0: 'batch_size'}, output_names[0]: {0: 'batch_size'}}
-    if len(output_names) > 1: # Add dynamic axis for the second output if it exists
-        dynamic_axes_config[output_names[1]] = {0: 'batch_size'}
-
-
-    try:
-        print(f"Exporting model to ONNX: {onnx_path}")
-        torch.onnx.export(
-            model,
-            dummy_input,
-            str(onnx_path),
-            export_params=True,
-            opset_version=opset_version,
-            do_constant_folding=True,
-            input_names=['input_image'],
-            output_names=output_names,
-            dynamic_axes=dynamic_axes_config
-        )
-        print(f"✅ Model exported to ONNX: {onnx_path}")
-    except Exception as e:
-        print(f"❌ Error exporting to ONNX: {e}")
-
-# ============================ Main Evaluation Script ============================ #
-
-def main_evaluate():
-    parser = argparse.ArgumentParser(description="Evaluate Pneumonia Detection Model and Generate CAMs")
-
-    parser.add_argument('--checkpoint_path', type=str, required=True, help="Path to the model checkpoint (.pth file).")
-    parser.add_argument('--project_root_dir', type=str, default='.', help="Root directory of the project.")
-    parser.add_argument('--dataset_csv_path', type=str, default='Pneumonia/stage_2_train_labels.csv', help="Path to dataset CSV for evaluation.")
-    parser.add_argument('--processed_data_dir', type=str, default='Processed', help="Directory with processed .npy files for evaluation.")
-    parser.add_argument('--eval_split', type=str, default='val', choices=['train', 'val', 'test'], help="Dataset split to evaluate ('val' or 'test' typically).")
-
-    parser.add_argument('--model_name', type=str, default=None, help="Name of TIMM model (if not in checkpoint or to override).")
-    parser.add_argument('--img_size', type=int, default=None, help="Image size (if not in checkpoint or to override).")
-    parser.add_argument('--in_channels', type=int, default=1, help="Input channels (if not in checkpoint or to override).")
-    parser.add_argument('--batch_size', type=int, default=32, help="Batch size for evaluation.")
-    parser.add_argument('--num_workers', type=int, default=os.cpu_count() // 2 if os.cpu_count() is not None and os.cpu_count() > 1 else 1, help="DataLoader workers.")
-
-    parser.add_argument('--generate_cam', action='store_true', help="Generate and visualize CAM for random samples.")
-    parser.add_argument('--num_cam_samples', type=int, default=5, help="Number of random samples for CAM visualization.")
-
-    parser.add_argument('--export_onnx', action='store_true', help="Export the loaded model to ONNX format.")
-    parser.add_argument('--onnx_filename', type=str, default="pneumonia_model.onnx", help="Filename for the exported ONNX model.")
-
-    args = parser.parse_args()
-
-    model_kwargs_from_args = {}
-    if args.model_name: model_kwargs_from_args['pretrained_model_name'] = args.model_name
-    if args.img_size: model_kwargs_from_args['img_size'] = args.img_size
-    if args.in_channels: model_kwargs_from_args['in_channels'] = args.in_channels
-
-    model = load_model_from_checkpoint(args.checkpoint_path, device=DEVICE, **model_kwargs_from_args)
-
-    eval_data_path = Path(args.project_root_dir) / args.processed_data_dir / args.eval_split
-    if not eval_data_path.exists():
-        raise FileNotFoundError(f"Evaluation data split directory not found: {eval_data_path}")
-
-    labels_df_path = Path(args.project_root_dir) / args.dataset_csv_path
-    if not labels_df_path.exists():
-        raise FileNotFoundError(f"Labels CSV for evaluation not found: {labels_df_path}")
-    labels_df = pd.read_csv(labels_df_path)
-    labels_df = labels_df.assign(
-        nonnull_count=labels_df.drop(columns="patientId", errors='ignore').notnull().sum(axis=1)
-    ).sort_values(
-        by=["patientId", "nonnull_count"], ascending=[True, False]
-    ).drop_duplicates(
-        subset="patientId", keep="first"
-    ).drop(columns="nonnull_count")
-
-    transform_img_size = model.img_size if hasattr(model, 'img_size') else args.img_size
-    if transform_img_size is None:
-        transform_img_size = DEFAULT_IMG_SIZE
-        print(f"Warning: Using default img_size {transform_img_size} for transforms.")
-
-    eval_transforms = get_val_transforms(mean=DEFAULT_MEAN, std=DEFAULT_STD)
-
-    eval_dataset = PneumoniaDataset(
-        dataframe=labels_df,
-        processed_root_dir=eval_data_path,
-        transform=eval_transforms,
-        dataset_split=args.eval_split
-    )
-    if len(eval_dataset) == 0:
-        print(f"Warning: Evaluation dataset for split '{args.eval_split}' is empty. Skipping evaluation.")
+            if cam_np is not None and cam_logits is not None:
+                actual_label = label.item() # label is a tensor like tensor([0.])
+                # Use patient ID if possible for filename, otherwise index
+                patient_id_for_cam = eval_dataset.samples[idx][0].stem # Get patient_id from Path object
+                cam_filename = f'cam_{args.split}_sample_{patient_id_for_cam}_idx_{idx}_label_{actual_label:.0f}_pred_{torch.sigmoid(cam_logits).item():.2f}.png'
+                visualize_and_save_cam(
+                    img_tensor, # Pass the (normalized) tensor as returned by dataset
+                    cam_np, 
+                    cam_logits, 
+                    cam_output_dir / cam_filename
+                )
+        print(f"CAM visualizations saved to {cam_output_dir}")
     else:
-        eval_loader = DataLoader(
-            eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
-        )
-        print(f"Evaluating on {len(eval_dataset)} samples from '{args.eval_split}' split...")
-        metrics = evaluate_model(model, eval_loader, device=DEVICE)
-        print("\n--- Evaluation Metrics ---")
-        for k, v in metrics.items():
-            if isinstance(v, (list, np.ndarray)): # Check if list or numpy array for direct print
-                 print(f"{k}: {v}")
-            else: # Assume float for formatting
-                 print(f"{k}: {v:.4f}")
+        print("Skipping CAM generation.")
+    print("Evaluation finished.")
 
-    if args.generate_cam and len(eval_dataset) > 0:
-        print(f"\n--- Generating CAM for {args.num_cam_samples} random samples ---")
-        # Ensure eval_dataset.samples is populated
-        if not eval_dataset.samples:
-            print("Warning: eval_dataset.samples is empty. Cannot generate CAMs.")
-            return # or handle error appropriately
-
-        random_indices = random.sample(range(len(eval_dataset)), min(args.num_cam_samples, len(eval_dataset)))
-
-        for i, idx in enumerate(random_indices):
-            img_tensor, label_tensor = eval_dataset[idx]
-
-            original_npy_path = eval_dataset.samples[idx][0]
-            original_img_np = PneumoniaDataset._load_file(original_npy_path)
-
-            if original_img_np.ndim == 3 and original_img_np.shape[0] == 1:
-                original_img_np = original_img_np.squeeze(0)
-
-            print(f"Sample {i+1}/{args.num_cam_samples} (Index: {idx}, Path: {original_npy_path})")
-
-            cam_output, probability = generate_cam(model, img_tensor, target_size=(original_img_np.shape[1], original_img_np.shape[0]))
-            visualize_cam_overlay(original_img_np, cam_output, probability, actual_label=int(label_tensor.item()))
-            # time.sleep(0.5) # Removed for non-blocking behavior by default
-
-    if args.export_onnx:
-        onnx_batch, onnx_channels, onnx_height, onnx_width = 1, DEFAULT_IN_CHANNELS, DEFAULT_IMG_SIZE, DEFAULT_IMG_SIZE # Fallbacks
-        if hasattr(model, 'in_channels'): onnx_channels = model.in_channels
-        elif args.in_channels: onnx_channels = args.in_channels
-        if hasattr(model, 'img_size'): onnx_height = onnx_width = model.img_size
-        elif args.img_size: onnx_height = onnx_width = args.img_size
-
-        dummy_shape = (onnx_batch, onnx_channels, onnx_height, onnx_width)
-        onnx_file_path = Path(args.project_root_dir) / args.onnx_filename
-        export_to_onnx(model, dummy_shape, onnx_file_path)
-
-    print("\nEvaluation script finished.")
-
-if __name__ == "__main__":
-    # Define fallbacks for CLI examples if these constants are not globally defined
-    DEFAULT_IN_CHANNELS = 1
-    DEFAULT_IMG_SIZE = 256
-
-    # Example commands (run from project root e.g. pneumonia_cam_project/):
-    #
-    # To evaluate a model on the 'val' split:
-    # python -m pneumonia_cam.evaluate --checkpoint_path experiments/your_model_run/best_model_epoch_X.pth --processed_data_dir Processed --eval_split val
-    #
-    # To also generate CAMs:
-    # python -m pneumonia_cam.evaluate --checkpoint_path path/to/best_model.pth --generate_cam --num_cam_samples 3
-    #
-    # To also export to ONNX:
-    # python -m pneumonia_cam.evaluate --checkpoint_path path/to/best_model.pth --export_onnx --onnx_filename my_pneumonia_model.onnx
-    main_evaluate()
+if __name__ == '__main__':
+    parser = define_arg_parser()
+    args = parser.parse_args()
+    main(args)
